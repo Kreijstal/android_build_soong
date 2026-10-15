@@ -17,6 +17,7 @@ package cc
 import (
 	"path/filepath"
 
+	"github.com/google/blueprint"
 	"github.com/google/blueprint/depset"
 	"github.com/google/blueprint/proptools"
 
@@ -34,6 +35,7 @@ func RegisterPrebuiltBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("cc_prebuilt_test_library_shared", PrebuiltSharedTestLibraryFactory)
 	ctx.RegisterModuleType("cc_prebuilt_object", PrebuiltObjectFactory)
 	ctx.RegisterModuleType("cc_prebuilt_binary", PrebuiltBinaryFactory)
+	ctx.RegisterModuleType("cc_packaged_library_host", PackagedHostLibraryFactory)
 }
 
 type prebuiltLinkerInterface interface {
@@ -85,6 +87,13 @@ type prebuiltLibraryInterface interface {
 type prebuiltLibraryLinker struct {
 	*libraryDecorator
 	prebuiltLinker
+
+	packagedHost      bool
+	packageProperties struct {
+		// Complete snapshot inputs, including headers and dependency snapshots.
+		// Missing inputs select the source module instead of a partial package.
+		Package_files []string
+	}
 }
 
 var _ prebuiltLinkerInterface = (*prebuiltLibraryLinker)(nil)
@@ -102,6 +111,9 @@ func (p *prebuiltLibraryLinker) linkerProps() []interface{} {
 
 func (p *prebuiltLibraryLinker) link(ctx ModuleContext,
 	flags Flags, deps PathDeps, objs Objects) android.Path {
+	if p.packagedHost && !p.Prebuilt.UsePrebuilt() {
+		return nil
+	}
 
 	p.libraryDecorator.flagExporter.exportIncludes(ctx)
 	p.libraryDecorator.flagExporter.reexportDirs(deps.ReexportedDirs...)
@@ -139,7 +151,11 @@ func (p *prebuiltLibraryLinker) link(ctx ModuleContext,
 		}
 
 		if p.static() {
-			depSet := depset.NewBuilder[android.Path](depset.TOPOLOGICAL).Direct(in).Build()
+			depSetBuilder := depset.NewBuilder[android.Path](depset.TOPOLOGICAL).Direct(in)
+			if p.packagedHost {
+				depSetBuilder.Transitive(deps.TranstiveStaticLibrariesForOrdering)
+			}
+			depSet := depSetBuilder.Build()
 			android.SetProvider(ctx, StaticLibraryInfoProvider, StaticLibraryInfo{
 				StaticLibrary: in,
 
@@ -292,7 +308,28 @@ func NewPrebuiltLibrary(hod android.HostOrDeviceSupported, srcsProperty string) 
 	if srcsProperty == "" {
 		android.InitPrebuiltModuleWithoutSrcs(module)
 	} else {
-		srcsSupplier := func(ctx android.BaseModuleContext, _ android.Module) []string {
+		srcsSupplier := func(ctx android.BaseModuleContext, candidate android.Module) []string {
+			if prebuilt.packagedHost {
+				p := candidate.(*Module).linker.(*prebuiltLibraryLinker)
+				if !ctx.Config().IsEnvTrue("LINEAGE_USE_PACKAGED_HOST_LIBS") ||
+					ctx.Target().Os != android.Linux || ctx.Target().Arch.ArchType != android.X86_64 ||
+					len(ctx.Config().SanitizeHost()) != 0 ||
+					ctx.Module().(*Module).sanitize.Properties.SanitizerEnabled ||
+					!candidate.Enabled(ctx) {
+					return nil
+				}
+				srcs := p.prebuiltSrcs(ctx)
+				if len(p.packageProperties.Package_files) == 0 {
+					ctx.OtherModuleErrorf(candidate, "package_files must describe the complete package inputs")
+					return nil
+				}
+				for _, file := range append(append([]string{}, p.packageProperties.Package_files...), srcs...) {
+					if !android.ExistentPathForSource(ctx, ctx.OtherModuleDir(candidate), file).Valid() {
+						return nil
+					}
+				}
+				return srcs
+			}
 			return prebuilt.prebuiltSrcs(ctx)
 		}
 
@@ -300,6 +337,29 @@ func NewPrebuiltLibrary(hod android.HostOrDeviceSupported, srcsProperty string) 
 	}
 
 	return module, library
+}
+
+// cc_packaged_library_host uses reviewed host C library snapshots. Standard
+// static/shared dependencies and exported headers retain their usual providers;
+// only matching Linux/glibc x86-64 host variants can replace source modules.
+func PackagedHostLibraryFactory() android.Module {
+	module, _ := NewPrebuiltLibrary(android.HostSupportedNoCross, "srcs")
+	p := module.linker.(*prebuiltLibraryLinker)
+	p.packagedHost = true
+	module.AddProperties(&p.packageProperties)
+	p.Prebuilt.ForcePrefer()
+	return module.Init()
+}
+
+func (c *Module) SelectPrebuiltAfterVariants() bool {
+	p, ok := c.linker.(*prebuiltLibraryLinker)
+	return ok && p.packagedHost
+}
+
+func (c *Module) ReplaceSourceDependency(tag blueprint.DependencyTag) bool {
+	// A prebuilt archive carries no compiler objects. Source shared variants
+	// must continue reusing objects from the original static source variant.
+	return tag != reuseObjTag && tag != staticVariantTag
 }
 
 func (p *prebuiltLibraryLinker) compile(ctx ModuleContext, flags Flags, deps PathDeps) Objects {

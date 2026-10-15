@@ -120,6 +120,20 @@ type Prebuilt struct {
 	srcsPropertyName string
 }
 
+// PrebuiltSelectionAfterVariants allows optional packages to make their
+// selection after architecture/linkage variants and their availability exist.
+// Call PrebuiltSelectAfterVariantsMutator after the relevant transitions.
+type PrebuiltSelectionAfterVariants interface {
+	SelectPrebuiltAfterVariants() bool
+	// Preserve source-only edges such as compilation-object reuse.
+	ReplaceSourceDependency(blueprint.DependencyTag) bool
+}
+
+func selectsPrebuiltAfterVariants(m Module) bool {
+	deferred, ok := m.(PrebuiltSelectionAfterVariants)
+	return ok && deferred.SelectPrebuiltAfterVariants()
+}
+
 // RemoveOptionalPrebuiltPrefix returns the result of removing the "prebuilt_" prefix from the
 // supplied name if it has one, or returns the name unmodified if it does not.
 func RemoveOptionalPrebuiltPrefix(name string) string {
@@ -528,7 +542,7 @@ func PrebuiltSelectModuleMutator(ctx BottomUpMutatorContext) {
 		if p.srcsSupplier == nil && p.srcsPropertyName == "" {
 			panic(fmt.Errorf("prebuilt module did not have InitPrebuiltModule called on it"))
 		}
-		if !p.properties.SourceExists {
+		if !p.properties.SourceExists && !selectsPrebuiltAfterVariants(m) {
 			p.properties.UsePrebuilt = p.usePrebuilt(ctx, nil, m)
 		}
 		// Propagate the provider received from `all_apex_contributions`
@@ -547,6 +561,9 @@ func PrebuiltSelectModuleMutator(ctx BottomUpMutatorContext) {
 			psi, _ = OtherModuleProvider(ctx, am, PrebuiltSelectionInfoProvider)
 		})
 		ctx.visitDirectDepsWithTag(PrebuiltDepTag, func(prebuiltModule Module) {
+			if selectsPrebuiltAfterVariants(prebuiltModule) {
+				return
+			}
 			p := GetEmbeddedPrebuilt(prebuiltModule)
 			if p.usePrebuilt(ctx, s, prebuiltModule) {
 				// skip the check when the source module is `override_X` because it's only a placeholder
@@ -583,6 +600,30 @@ func PrebuiltSelectModuleMutator(ctx BottomUpMutatorContext) {
 	if am, ok := m.(*allApexContributions); ok {
 		am.SetPrebuiltSelectionInfoProvider(ctx)
 	}
+}
+
+// PrebuiltSelectAfterVariantsMutator handles explicitly deferred packages only.
+// Normal prebuilts retain their existing selection order and semantics.
+func PrebuiltSelectAfterVariantsMutator(ctx BottomUpMutatorContext) {
+	m := ctx.Module()
+	if p := GetEmbeddedPrebuilt(m); p != nil {
+		if selectsPrebuiltAfterVariants(m) && !p.properties.SourceExists {
+			p.properties.UsePrebuilt = p.usePrebuilt(ctx, nil, m)
+		}
+		return
+	}
+	ctx.visitDirectDepsWithTag(PrebuiltDepTag, func(candidate Module) {
+		if !selectsPrebuiltAfterVariants(candidate) {
+			return
+		}
+		p := GetEmbeddedPrebuilt(candidate)
+		if p.usePrebuilt(ctx, m, candidate) {
+			checkInvariantsForSourceAndPrebuilt(ctx, m.PartitionTag(ctx.DeviceConfig()),
+				[]string{candidate.PartitionTag(ctx.DeviceConfig())}, []string{ctx.OtherModuleName(candidate)})
+			p.properties.UsePrebuilt = true
+			m.ReplacedByPrebuilt()
+		}
+	})
 }
 
 var PrebuiltInfoProvider = blueprint.NewMutatorProvider[PrebuiltInfo]("prebuilt_provider")
@@ -683,6 +724,15 @@ func PrebuiltPostDepsMutator(ctx BottomUpMutatorContext) {
 		if p.properties.UsePrebuilt {
 			if p.properties.SourceExists {
 				ctx.ReplaceDependenciesIf(name, func(from blueprint.Module, tag blueprint.DependencyTag, to blueprint.Module) bool {
+					// Source shared libraries may also depend on the packaged
+					// static variant for object reuse. Those edges must not make
+					// a static package replace the source shared implementation.
+					if deferred, ok := m.(PrebuiltSelectionAfterVariants); ok && deferred.SelectPrebuiltAfterVariants() {
+						if !deferred.ReplaceSourceDependency(tag) ||
+							ctx.OtherModuleSubDir(to.(Module)) != ctx.OtherModuleSubDir(m) {
+							return false
+						}
+					}
 					if t, ok := tag.(ReplaceSourceWithPrebuilt); ok {
 						return t.ReplaceSourceWithPrebuilt()
 					}

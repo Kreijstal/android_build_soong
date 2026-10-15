@@ -16,7 +16,10 @@ package cc
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"android/soong/android"
@@ -651,4 +654,202 @@ func TestSystemBuildToolReplacesCcHostOnly(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPackagedHostLibrary(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("packaged host libraries require Linux x86-64")
+	}
+	for _, tc := range []struct {
+		name, optIn, missing string
+		selected             bool
+	}{
+		{"default source", "", "", false},
+		{"selected", "true", "", true},
+		{"missing archive", "true", "pkg/libexample.a", false},
+		{"missing shared object", "true", "pkg/libexample.so", false},
+		{"missing header", "true", "pkg/include/example.h", false},
+		{"missing dependency input", "true", "pkg/dep.json", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := android.MockFS{
+				"source.c":                  nil,
+				"adapters/pkg/libexample.a": nil, "adapters/pkg/libexample.so": nil,
+				"adapters/pkg/include/example.h": nil, "adapters/pkg/dep.json": nil,
+				"adapters/Android.bp": []byte(`
+                    cc_packaged_library_host {
+                        name: "libexample", stl: "none", compile_multilib: "64",
+                        static: { srcs: ["pkg/libexample.a"] },
+                        shared: { srcs: ["pkg/libexample.so"] },
+                        export_include_dirs: ["pkg/include"],
+                        package_files: ["pkg/libexample.a", "pkg/libexample.so", "pkg/include/example.h", "pkg/dep.json"],
+                    }
+                `),
+			}
+			if tc.missing != "" {
+				delete(fs, "adapters/"+tc.missing)
+			}
+			result := android.GroupFixturePreparers(
+				prepareForPrebuiltTest,
+				android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_PACKAGED_HOST_LIBS": tc.optIn}),
+				fs.AddToFixture(),
+			).RunTestWithBp(t, `
+                cc_library { name: "libexample", host_supported: true, stl: "none", srcs: ["source.c"] }
+                cc_binary_host { name: "static_consumer", stl: "none", static_libs: ["libexample"] }
+                cc_binary_host { name: "shared_consumer", stl: "none", shared_libs: ["libexample"] }
+            `)
+			host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+			want := tc.selected && result.Config.BuildOS == android.Linux
+			for _, linkage := range []string{"static", "shared"} {
+				source := result.ModuleForTests(t, "libexample", host+"_"+linkage).Module().(*Module)
+				if source.IsReplacedByPrebuilt() != want {
+					t.Fatalf("%s replacement = %v, want %v", linkage, source.IsReplacedByPrebuilt(), want)
+				}
+				consumer := result.ModuleForTests(t, linkage+"_consumer", host).Module()
+				chosen := source
+				if want {
+					chosen = result.ModuleForTests(t, "prebuilt_libexample", host+"_"+linkage).Module().(*Module)
+				}
+				if !android.HasDirectDep(result.TestContext, consumer, chosen) {
+					t.Fatalf("%s consumer did not select expected library", linkage)
+				}
+				if want {
+					exports := android.OtherModuleProviderOrDefault(result.TestContext, chosen, FlagExporterInfoProvider)
+					android.AssertPathsRelativeToTopEquals(t, "package include path", []string{"adapters/pkg/include"}, exports.IncludeDirs)
+				}
+				device := result.ModuleForTests(t, "libexample", "android_arm64_armv8-a_"+linkage).Module().(*Module)
+				if device.IsReplacedByPrebuilt() {
+					t.Fatal("host package replaced device library")
+				}
+			}
+		})
+	}
+}
+
+func TestPackagedHostLibraryStaticOnly(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("packaged host libraries require Linux x86-64")
+	}
+	result := android.GroupFixturePreparers(
+		prepareForPrebuiltTest,
+		android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_PACKAGED_HOST_LIBS": "true"}),
+		android.MockFS{"pkg/libexample.a": nil, "pkg/include/example.h": nil, "source.c": nil}.AddToFixture(),
+	).RunTestWithBp(t, `
+        cc_library { name: "libexample", host_supported: true, stl: "none", srcs: ["source.c"] }
+        cc_packaged_library_host {
+            name: "libexample", stl: "none", compile_multilib: "64",
+            static: { srcs: ["pkg/libexample.a"] }, shared: { enabled: false },
+            export_include_dirs: ["pkg/include"],
+            package_files: ["pkg/libexample.a", "pkg/include/example.h"],
+        }
+        cc_binary_host { name: "static_consumer", stl: "none", static_libs: ["libexample"] }
+        cc_binary_host { name: "shared_consumer", stl: "none", shared_libs: ["libexample"] }
+    `)
+	host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+	staticConsumer := result.ModuleForTests(t, "static_consumer", host).Module()
+	sharedConsumer := result.ModuleForTests(t, "shared_consumer", host).Module()
+	sharedSource := result.ModuleForTests(t, "libexample", host+"_shared").Module()
+	if !android.HasDirectDep(result.TestContext, sharedConsumer, sharedSource) {
+		t.Fatal("unsupported shared variant did not retain source dependency")
+	}
+	sourceStatic := result.ModuleForTests(t, "libexample", host+"_static").Module()
+	if !android.HasDirectDep(result.TestContext, sharedSource, sourceStatic) {
+		t.Fatal("source shared implementation lost its source compilation objects")
+	}
+	staticName := "libexample"
+	if result.Config.BuildOS == android.Linux {
+		staticName = "prebuilt_libexample"
+	}
+	staticProvider := result.ModuleForTests(t, staticName, host+"_static").Module()
+	if !android.HasDirectDep(result.TestContext, staticConsumer, staticProvider) {
+		t.Fatal("static package not selected")
+	}
+}
+
+// Optional end-to-end graph check for the companion preparer's real LZ4 output.
+func TestPackagedHostLibraryGeneratedLz4(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("packaged host libraries require Linux x86-64")
+	}
+	root := os.Getenv("LINEAGE_UR_LZ4_TEST_SNAPSHOT")
+	if root == "" {
+		t.Skip("set LINEAGE_UR_LZ4_TEST_SNAPSHOT to a prepared LZ4 snapshot directory")
+	}
+	fs := android.MockFS{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fs["adapters/"+filepath.ToSlash(rel)] = data
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := android.GroupFixturePreparers(
+		prepareForPrebuiltTest,
+		android.PrepareForTestWithLicenses,
+		android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_PACKAGED_HOST_LIBS": "true"}),
+		fs.AddToFixture(),
+	).RunTestWithBp(t, `
+        license_kind { name: "fixture_kind" }
+        license { name: "external_lz4_lib_license", license_kinds: ["fixture_kind"], visibility: ["//visibility:public"] }
+        cc_library { name: "liblz4", host_supported: true, stl: "none" }
+        cc_binary_host { name: "static_consumer", stl: "none", static_libs: ["liblz4"] }
+        cc_binary_host { name: "shared_consumer", stl: "none", shared_libs: ["liblz4"] }
+    `)
+	host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+	for _, linkage := range []string{"static", "shared"} {
+		consumer := result.ModuleForTests(t, linkage+"_consumer", host).Module()
+		selected := result.ModuleForTests(t, "prebuilt_liblz4", host+"_"+linkage).Module()
+		if !android.HasDirectDep(result.TestContext, consumer, selected) {
+			t.Fatalf("generated %s LZ4 adapter not selected", linkage)
+		}
+	}
+}
+
+func TestPackagedHostLibraryDependencyOrdering(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("packaged host libraries require Linux x86-64")
+	}
+	result := android.GroupFixturePreparers(
+		prepareForPrebuiltTest,
+		android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_PACKAGED_HOST_LIBS": "true"}),
+		android.MockFS{"pkg/a.a": nil, "pkg/b.a": nil, "pkg/b_include/b.h": nil}.AddToFixture(),
+	).RunTestWithBp(t, `
+        cc_library_static { name: "liba", host_supported: true, stl: "none", static_libs: ["libb"] }
+        cc_library_static { name: "libb", host_supported: true, stl: "none" }
+        cc_packaged_library_host {
+            name: "liba", stl: "none", compile_multilib: "64",
+            static: { srcs: ["pkg/a.a"] }, shared: { enabled: false },
+            static_libs: ["libb"], export_static_lib_headers: ["libb"],
+            package_files: ["pkg/a.a", "pkg/b.a", "pkg/b_include/b.h"],
+        }
+        cc_packaged_library_host {
+            name: "libb", stl: "none", compile_multilib: "64",
+            static: { srcs: ["pkg/b.a"] }, shared: { enabled: false },
+            export_include_dirs: ["pkg/b_include"],
+            package_files: ["pkg/b.a", "pkg/b_include/b.h"],
+        }
+        cc_binary_host { name: "consumer", stl: "none", static_libs: ["libb", "liba"] }
+    `)
+	host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+	flags := result.ModuleForTests(t, "consumer", host).Rule("ld").Args["libFlags"]
+	if strings.Index(flags, "pkg/a.a") < 0 || strings.Index(flags, "pkg/a.a") > strings.Index(flags, "pkg/b.a") {
+		t.Fatalf("packaged dependency link order not preserved: %s", flags)
+	}
+	chosen := result.ModuleForTests(t, "prebuilt_liba", host+"_static").Module()
+	exports := android.OtherModuleProviderOrDefault(result.TestContext, chosen, FlagExporterInfoProvider)
+	android.AssertPathsRelativeToTopEquals(t, "reexported dependency headers", []string{"pkg/b_include"}, exports.IncludeDirs)
 }

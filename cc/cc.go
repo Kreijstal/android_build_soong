@@ -302,6 +302,7 @@ func RegisterCCBuildComponents(ctx android.RegistrationContext) {
 		ctx.Transition("link", &linkageTransitionMutator{})
 		ctx.Transition("version", &versionTransitionMutator{})
 		ctx.BottomUp("begin", BeginMutator)
+		ctx.BottomUp("packaged_prebuilt_select", android.PrebuiltSelectAfterVariantsMutator)
 	})
 
 	ctx.PostDepsMutators(func(ctx android.RegisterMutatorsContext) {
