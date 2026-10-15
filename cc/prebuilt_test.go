@@ -853,3 +853,77 @@ func TestPackagedHostLibraryDependencyOrdering(t *testing.T) {
 	exports := android.OtherModuleProviderOrDefault(result.TestContext, chosen, FlagExporterInfoProvider)
 	android.AssertPathsRelativeToTopEquals(t, "reexported dependency headers", []string{"pkg/b_include"}, exports.IncludeDirs)
 }
+
+func TestSystemBuildToolGeneratedLz4(t *testing.T) {
+	root := os.Getenv("LINEAGE_UR_SYSTEM_TOOLS_TEST_SNAPSHOT")
+	if root == "" {
+		t.Skip("set LINEAGE_UR_SYSTEM_TOOLS_TEST_SNAPSHOT to a prepared system-lz4 directory")
+	}
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("system tool snapshot is Linux x86-64")
+	}
+	for _, tc := range []struct {
+		name, optIn       string
+		missing, selected bool
+	}{
+		{"selected", "true", false, true},
+		{"opted out", "false", false, false},
+		{"removed snapshot", "true", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := android.MockFS{}
+			err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.IsDir() {
+					return nil
+				}
+				rel, err := filepath.Rel(root, path)
+				if err != nil {
+					return err
+				}
+				if tc.missing && strings.HasPrefix(filepath.ToSlash(rel), "snapshots/") {
+					return nil
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				fs["adapters/"+filepath.ToSlash(rel)] = data
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := android.GroupFixturePreparers(
+				prepareForPrebuiltTest,
+				android.PrepareForTestWithLicenses,
+				android.FixtureRegisterWithContext(func(ctx android.RegistrationContext) {
+					ctx.RegisterModuleType("system_build_tool", android.NewSystemBuildTool)
+				}),
+				android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_SYSTEM_TOOLS": tc.optIn}),
+				fs.AddToFixture(),
+			).RunTestWithBp(t, `
+                license_kind { name: "fixture_kind" }
+                license { name: "external_lz4_programs_license", license_kinds: ["fixture_kind"], visibility: ["//visibility:public"] }
+                cc_library_static { name: "liblz4", host_supported: true, stl: "none" }
+                cc_binary_host { name: "lz4", stl: "none", static_libs: ["liblz4"] }
+                genrule { name: "ramdisk", tools: ["lz4"], out: ["ramdisk.lz4"], cmd: "$(location lz4) -l -12 --favor-decSpeed > $(out)" }
+            `)
+			host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+			source := result.ModuleForTests(t, "lz4", host).Module().(*Module)
+			if source.IsReplacedByPrebuilt() != tc.selected {
+				t.Fatalf("system lz4 replacement = %v, want %v", source.IsReplacedByPrebuilt(), tc.selected)
+			}
+			if tc.selected {
+				prebuilt := result.ModuleForTests(t, "prebuilt_lz4", host)
+				if !strings.HasPrefix(prebuilt.Output("lz4").Input.String(), "adapters/snapshots/lz4-") {
+					t.Fatal("lz4 did not select the system snapshot")
+				}
+				entries := android.AndroidMkEntriesForTest(t, result.TestContext, prebuilt.Module())
+				android.AssertStringEquals(t, "Make executable name", "lz4", entries[0].EntryMap["LOCAL_MODULE"][0])
+			}
+		})
+	}
+}
