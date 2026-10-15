@@ -1356,3 +1356,55 @@ func useSourceFactory() android.Module {
 	android.InitAndroidModule(module)
 	return module
 }
+
+// Verify selection through a real genrule consumer, including sandbox packaging.
+func TestSystemBuildTool(t *testing.T) {
+	for _, tc := range []struct {
+		name, optIn       string
+		present, selected bool
+	}{
+		{"default source", "", true, false},
+		{"explicitly disabled", "false", true, false},
+		{"system selected", "true", true, true},
+		{"missing snapshot fallback", "true", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := android.MockFS{
+				"adapters/Android.bp": []byte(`system_build_tool { name: "tool", src: "snapshots/tool" }`),
+			}
+			if tc.present {
+				fs["adapters/snapshots/tool"] = nil
+			}
+			result := android.GroupFixturePreparers(
+				prepareForGenRuleTest,
+				android.FixtureRegisterWithContext(func(ctx android.RegistrationContext) {
+					ctx.RegisterModuleType("system_build_tool", android.NewSystemBuildTool)
+				}),
+				android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_SYSTEM_TOOLS": tc.optIn}),
+				android.FixtureMergeMockFs(fs),
+			).RunTestWithBp(t, `
+                tool { name: "tool" }
+                genrule {
+                    name: "gen", tools: ["tool"], out: ["foo"],
+                    cmd: "$(location tool)",
+                }
+            `)
+			gen := result.Module("gen", "").(*Module)
+			expected := "__SBOX_SANDBOX_DIR__/tools/out/bin/tool"
+			android.AssertStringEquals(t, "selected sandbox tool", expected, gen.rawCommands[0])
+			hostVariant := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+			prebuilt := result.Module("prebuilt_tool", hostVariant).(android.PrebuiltInterface)
+			if got := prebuilt.Prebuilt().UsePrebuilt(); got != tc.selected {
+				t.Fatalf("UsePrebuilt = %v, want %v", got, tc.selected)
+			}
+			if tc.selected {
+				android.AssertStringEquals(t, "adapter-relative snapshot", "adapters/snapshots/tool",
+					result.ModuleForTests(t, "prebuilt_tool", hostVariant).Output("tool").Input.String())
+			}
+			source := result.Module("tool", hostVariant).(*testTool)
+			if got := source.IsReplacedByPrebuilt(); got != tc.selected {
+				t.Fatalf("source replaced = %v, want %v", got, tc.selected)
+			}
+		})
+	}
+}

@@ -18,6 +18,7 @@ import "path/filepath"
 
 func init() {
 	RegisterModuleType("prebuilt_build_tool", NewPrebuiltBuildTool)
+	RegisterModuleType("system_build_tool", NewSystemBuildTool)
 }
 
 type prebuiltBuildToolProperties struct {
@@ -39,6 +40,9 @@ type prebuiltBuildTool struct {
 	properties prebuiltBuildToolProperties
 
 	toolPath OptionalPath
+
+	// Only the opt-in system_build_tool factory enables source fallback.
+	systemTool bool
 }
 
 func (t *prebuiltBuildTool) Name() string {
@@ -56,6 +60,9 @@ func (t *prebuiltBuildTool) DepsMutator(ctx BottomUpMutatorContext) {
 }
 
 func (t *prebuiltBuildTool) GenerateAndroidBuildActions(ctx ModuleContext) {
+	if t.systemTool && !t.prebuilt.UsePrebuilt() {
+		return
+	}
 	sourcePath := t.prebuilt.SingleSourcePath(ctx)
 	installedPath := PathForModuleOut(ctx, t.BaseModuleName())
 	deps := PathsForModuleSrc(ctx, t.properties.Deps)
@@ -74,6 +81,13 @@ func (t *prebuiltBuildTool) GenerateAndroidBuildActions(ctx ModuleContext) {
 			"fromPath": fromPath,
 		},
 	})
+	if t.systemTool {
+		// Preserve the normal host bin path for Make and direct-path users too.
+		ctx.InstallFile(PathForModuleInstall(ctx, "bin"), t.BaseModuleName(), installedPath)
+		ctx.SetOutputFiles(Paths{installedPath}, "")
+		t.toolPath = OptionalPathForPath(installedPath)
+		return
+	}
 
 	packagingDir := PathForModuleInstall(ctx, t.BaseModuleName())
 	ctx.PackageFile(packagingDir, sourcePath.String(), sourcePath)
@@ -85,6 +99,9 @@ func (t *prebuiltBuildTool) GenerateAndroidBuildActions(ctx ModuleContext) {
 }
 
 func (t *prebuiltBuildTool) MakeVars(ctx MakeVarsModuleContext) []ModuleMakeVarsValue {
+	if t.systemTool && !t.prebuilt.UsePrebuilt() {
+		return nil
+	}
 	if makeVar := String(t.properties.Export_to_make_var); makeVar != "" &&
 		t.Target().Os == ctx.Config().BuildOS {
 		return []ModuleMakeVarsValue{{makeVar, t.toolPath.String()}}
@@ -104,6 +121,51 @@ func NewPrebuiltBuildTool() Module {
 	module := &prebuiltBuildTool{}
 	module.AddProperties(&module.properties)
 	InitSingleSourcePrebuiltModule(module, &module.properties, "Src")
+	InitAndroidArchModule(module, HostSupportedNoCross, MultilibFirst)
+	return module
+}
+
+// system_build_tool selects a compatibility-checked, source-tree-local snapshot
+// of a system host executable. The caller prepares the snapshot before Soong;
+// graph generation never searches PATH or executes host probes. A matching
+// source module is required for fallback. Device variants are never created.
+//
+// Existing prebuilt_build_tool behavior is intentionally unchanged.
+type systemBuildTool struct {
+	prebuiltBuildTool
+}
+
+func (t *systemBuildTool) AndroidMkEntries() []AndroidMkEntries {
+	if !t.prebuilt.UsePrebuilt() {
+		return nil
+	}
+	return []AndroidMkEntries{{
+		Class:      "EXECUTABLES",
+		OutputFile: t.toolPath,
+		Include:    "$(BUILD_PREBUILT)",
+	}}
+}
+
+func NewSystemBuildTool() Module {
+	module := &systemBuildTool{prebuiltBuildTool: prebuiltBuildTool{systemTool: true}}
+	module.AddProperties(&module.properties)
+	InitPrebuiltModuleWithSrcSupplier(module, func(ctx BaseModuleContext, prebuilt Module) []string {
+		t := prebuilt.(*systemBuildTool)
+		if !t.Enabled(ctx) || !ctx.Config().IsEnvTrue("LINEAGE_USE_SYSTEM_TOOLS") {
+			return nil
+		}
+		src := String(t.properties.Src)
+		if src == "" {
+			return nil
+		}
+		// Track missing files too, so adding/removing a snapshot regenerates
+		// the graph and changes the source/prebuilt decision.
+		if !ExistentPathForSource(ctx, ctx.OtherModuleDir(prebuilt), src).Valid() {
+			return nil
+		}
+		return []string{src}
+	}, "src")
+	module.prebuilt.ForcePrefer()
 	InitAndroidArchModule(module, HostSupportedNoCross, MultilibFirst)
 	return module
 }

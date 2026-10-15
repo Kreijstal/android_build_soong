@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"android/soong/android"
+	"android/soong/genrule"
 )
 
 var prepareForPrebuiltTest = android.GroupFixturePreparers(
@@ -602,4 +603,52 @@ func TestMissingVariantInModuleSdk(t *testing.T) {
 	// Therefore source of libbar should be used.
 	android.AssertBoolEquals(t, fmt.Sprintf("expected dependency from libfoo to source libbar"), true,
 		android.HasDirectDep(ctx, libfoo, sourceLibBar))
+}
+
+// A system host tool must shadow a real cc binary without replacing its device variant.
+func TestSystemBuildToolReplacesCcHostOnly(t *testing.T) {
+	for _, enabled := range []string{"", "true"} {
+		t.Run("opt_in="+enabled, func(t *testing.T) {
+			result := android.GroupFixturePreparers(
+				prepareForPrebuiltTest,
+				genrule.PrepareForTestWithGenRuleBuildComponents,
+				android.FixtureRegisterWithContext(func(ctx android.RegistrationContext) {
+					ctx.RegisterModuleType("system_build_tool", android.NewSystemBuildTool)
+				}),
+				android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_SYSTEM_TOOLS": enabled}),
+				android.FixtureMergeMockFs(android.MockFS{"tool.c": nil, "snapshots/tool": nil}),
+			).RunTestWithBp(t, `
+                cc_binary { name: "example", host_supported: true, srcs: ["tool.c"] }
+                system_build_tool {
+                    name: "example", src: "snapshots/tool",
+                    enabled: false,
+                    target: { linux_glibc_x86_64: { enabled: true } },
+                }
+                genrule {
+                    name: "consumer", tools: ["example"],
+                    out: ["result"], cmd: "$(location example) > $(out)",
+                }
+            `)
+			hostVariant := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+			source := result.ModuleForTests(t, "example", hostVariant).Module().(*Module)
+			selected := enabled == "true" && result.Config.BuildOS == android.Linux
+			if source.IsReplacedByPrebuilt() != selected {
+				t.Fatalf("host source replacement = %v, want %v", source.IsReplacedByPrebuilt(), selected)
+			}
+			device := result.ModuleForTests(t, "example", "android_arm64_armv8-a").Module().(*Module)
+			if device.IsReplacedByPrebuilt() {
+				t.Fatal("replaced device executable with system host tool")
+			}
+			if selected {
+				prebuilt := result.ModuleForTests(t, "prebuilt_example", hostVariant)
+				android.AssertStringEquals(t, "snapshot input", "snapshots/tool", prebuilt.Output("example").Input.String())
+				entries := android.AndroidMkEntriesForTest(t, result.TestContext, prebuilt.Module())
+				if len(entries) != 1 || entries[0].Class != "EXECUTABLES" {
+					t.Fatal("system tool not exported as a Make host executable")
+				}
+				android.AssertStringEquals(t, "Make source name retained", "example", entries[0].EntryMap["LOCAL_MODULE"][0])
+				android.AssertStringEquals(t, "Make host executable", "true", entries[0].EntryMap["LOCAL_IS_HOST_MODULE"][0])
+			}
+		})
+	}
 }
