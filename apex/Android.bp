@@ -41,6 +41,8 @@ bootstrap_go_package {
         "vndk.go",
     ],
     testSrcs: [
+        "packaged_target_test.go",
+        "packaged_binary_test.go",
         "aconfig_test.go",
         "apex_test.go",
         "bootclasspath_fragment_test.go",

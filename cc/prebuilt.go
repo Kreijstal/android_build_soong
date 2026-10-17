@@ -36,6 +36,7 @@ func RegisterPrebuiltBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("cc_prebuilt_object", PrebuiltObjectFactory)
 	ctx.RegisterModuleType("cc_prebuilt_binary", PrebuiltBinaryFactory)
 	ctx.RegisterModuleType("cc_packaged_library_host", PackagedHostLibraryFactory)
+	ctx.RegisterModuleType("cc_packaged_library_shared_target", PackagedSharedTargetLibraryFactory)
 }
 
 type prebuiltLinkerInterface interface {
@@ -89,6 +90,8 @@ type prebuiltLibraryLinker struct {
 	prebuiltLinker
 
 	packagedHost      bool
+	packagedTarget    bool
+	binaryPackage     binaryPackageProperties
 	packageProperties struct {
 		// Complete snapshot inputs, including headers and dependency snapshots.
 		// Missing inputs select the source module instead of a partial package.
@@ -102,6 +105,9 @@ var _ prebuiltLibraryInterface = (*prebuiltLibraryLinker)(nil)
 func (p *prebuiltLibraryLinker) linkerInit(ctx BaseModuleContext) {}
 
 func (p *prebuiltLibraryLinker) linkerDeps(ctx DepsContext, deps Deps) Deps {
+	if p.packagedTarget && !p.Prebuilt.UsePrebuilt() {
+		return Deps{}
+	}
 	return p.libraryDecorator.linkerDeps(ctx, deps)
 }
 
@@ -111,7 +117,7 @@ func (p *prebuiltLibraryLinker) linkerProps() []interface{} {
 
 func (p *prebuiltLibraryLinker) link(ctx ModuleContext,
 	flags Flags, deps PathDeps, objs Objects) android.Path {
-	if p.packagedHost && !p.Prebuilt.UsePrebuilt() {
+	if (p.packagedHost || p.packagedTarget) && !p.Prebuilt.UsePrebuilt() {
 		return nil
 	}
 
@@ -309,6 +315,9 @@ func NewPrebuiltLibrary(hod android.HostOrDeviceSupported, srcsProperty string) 
 		android.InitPrebuiltModuleWithoutSrcs(module)
 	} else {
 		srcsSupplier := func(ctx android.BaseModuleContext, candidate android.Module) []string {
+			if prebuilt.packagedTarget {
+				return candidate.(*Module).linker.(*prebuiltLibraryLinker).packagedTargetSrcs(ctx, candidate.(*Module))
+			}
 			if prebuilt.packagedHost {
 				p := candidate.(*Module).linker.(*prebuiltLibraryLinker)
 				if !ctx.Config().IsEnvTrue("LINEAGE_USE_PACKAGED_HOST_LIBS") ||
@@ -353,7 +362,7 @@ func PackagedHostLibraryFactory() android.Module {
 
 func (c *Module) SelectPrebuiltAfterVariants() bool {
 	p, ok := c.linker.(*prebuiltLibraryLinker)
-	return ok && p.packagedHost
+	return ok && (p.packagedHost || p.packagedTarget)
 }
 
 func (c *Module) ReplaceSourceDependency(tag blueprint.DependencyTag) bool {
