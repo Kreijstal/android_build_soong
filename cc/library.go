@@ -399,6 +399,7 @@ func (f *flagExporter) setProvider(ctx android.ModuleContext) {
 // libraryDecorator wraps baseCompiler, baseLinker and baseInstaller to provide library-specific
 // functionality: static vs. shared linkage, reusing object files for shared libraries
 type libraryDecorator struct {
+	targetPackage     targetPackageProperties
 	Properties        LibraryProperties
 	StaticProperties  StaticProperties
 	SharedProperties  SharedProperties
@@ -470,6 +471,7 @@ func (library *libraryDecorator) linkerProps() []interface{} {
 	props = append(props, library.baseLinker.linkerProps()...)
 	props = append(props,
 		&library.Properties,
+		&library.targetPackage,
 		&library.MutatedProperties,
 		&library.flagExporter.Properties,
 		&library.stripper.StripProperties)
@@ -603,6 +605,9 @@ func (library *libraryDecorator) getHeaderAbiCheckerProperties(m *Module) header
 }
 
 func (library *libraryDecorator) compile(ctx ModuleContext, flags Flags, deps PathDeps) Objects {
+	if objects, selected := library.packagedTargetObjects(ctx, flags); selected {
+		return objects
+	}
 	sharedFlags := ctx.getSharedFlags()
 
 	if ctx.IsLlndk() {

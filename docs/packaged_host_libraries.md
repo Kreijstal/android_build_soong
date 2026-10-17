@@ -48,3 +48,17 @@ or a complete content-addressed build cache. Revalidate recipes when source,
 toolchain or configuration changes. Target libraries, C++ ABI adaptation,
 versioned SONAME layouts, download/publication infrastructure and fully isolated
 host runtimes are outside this adapter's scope.
+
+The companion preparer also accepts `unique_host_soname: true` for Android's
+`<module>-host.so` naming, preserving the existing SONAME and dependency names.
+The BoringSSL recipe exercises this with source-built shared `libssl` and
+`libcrypto` (whose C++ runtime is already incorporated in the shared artifacts).
+`TestPackagedHostLibraryGeneratedBoringSsl` checks the generated adapters when
+`LINEAGE_UR_BORINGSSL_TEST_SNAPSHOT` names a prepared snapshot directory.
+
+`TestPackagedHostLibraryGeneratedCLibraries` accepts a prepared six-library
+overlay via `LINEAGE_UR_C_LIBRARIES_TEST_OVERLAY`. It checks static/shared
+consumer dependencies, source fallback, unchanged device variants, PNG's zlib
+dependency, and component-local license visibility. The companion recipes
+cover bzip2, zlib, Expat, Zstandard, PNG and JPEG; legacy `libz_stable` stays on
+its source path.

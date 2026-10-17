@@ -819,6 +819,183 @@ func TestPackagedHostLibraryGeneratedLz4(t *testing.T) {
 	}
 }
 
+// Check the companion exporter's real host-only BoringSSL package, including
+// Android's distinct host SONAMEs and the pinned libssl -> libcrypto dependency.
+func TestPackagedHostLibraryGeneratedBoringSsl(t *testing.T) {
+	root := os.Getenv("LINEAGE_UR_BORINGSSL_TEST_SNAPSHOT")
+	if root == "" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("requires a prepared BoringSSL snapshot on Linux x86-64")
+	}
+	fs := android.MockFS{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fs["adapters/"+filepath.ToSlash(rel)] = data
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, enabled := range []string{"false", "true"} {
+		t.Run(enabled, func(t *testing.T) {
+			result := android.GroupFixturePreparers(
+				prepareForPrebuiltTest,
+				android.PrepareForTestWithLicenses,
+				android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_PACKAGED_HOST_LIBS": enabled}),
+				fs.AddToFixture(),
+			).RunTestWithBp(t, `
+                license_kind { name: "fixture_kind" }
+                license { name: "external_boringssl_license", license_kinds: ["fixture_kind"], visibility: ["//visibility:public"] }
+                cc_library { name: "libcrypto", host_supported: true, stl: "none", unique_host_soname: true }
+                cc_library { name: "libssl", host_supported: true, stl: "none", unique_host_soname: true, shared_libs: ["libcrypto"] }
+                cc_binary { name: "consumer", host_supported: true, stl: "none", shared_libs: ["libssl", "libcrypto"] }
+            `)
+			host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+			for _, name := range []string{"libssl", "libcrypto"} {
+				source := result.ModuleForTests(t, name, host+"_shared").Module().(*Module)
+				if source.IsReplacedByPrebuilt() != (enabled == "true") {
+					t.Fatalf("%s replacement disagrees with opt-in", name)
+				}
+				device := result.ModuleForTests(t, name, "android_arm64_armv8-a_shared").Module().(*Module)
+				if device.IsReplacedByPrebuilt() {
+					t.Fatal("host package replaced a device variant")
+				}
+				if enabled == "false" {
+					continue
+				}
+				prebuilt := result.ModuleForTests(t, "prebuilt_"+name, host+"_shared")
+				consumer := result.ModuleForTests(t, "consumer", host).Module()
+				if !android.HasDirectDep(result.TestContext, consumer, prebuilt.Module()) {
+					t.Fatalf("consumer does not use packaged %s", name)
+				}
+				info := android.OtherModuleProviderOrDefault(result.TestContext, prebuilt.Module(), SharedLibraryInfoProvider)
+				android.AssertStringEquals(t, "host library filename", name+"-host.so", info.SharedLibrary.Base())
+			}
+			if enabled == "true" {
+				ssl := result.ModuleForTests(t, "prebuilt_libssl", host+"_shared").Module()
+				crypto := result.ModuleForTests(t, "prebuilt_libcrypto", host+"_shared").Module()
+				if !android.HasDirectDep(result.TestContext, ssl, crypto) {
+					t.Fatal("packaged libssl lost its crypto dependency")
+				}
+			}
+		})
+	}
+}
+
+func TestPackagedHostLibraryGeneratedCLibraries(t *testing.T) {
+	root := os.Getenv("LINEAGE_UR_C_LIBRARIES_TEST_OVERLAY")
+	if root == "" || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("requires prepared C library snapshots on Linux x86-64")
+	}
+	fs := android.MockFS{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err == nil {
+			fs[filepath.ToSlash(rel)] = data
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bp := `
+        license_kind { name: "fixture_kind" }
+        cc_library_static { name: "libbz", host_supported: true, stl: "none" }
+        cc_library { name: "libz", host_supported: true, stl: "none", unique_host_soname: true }
+        cc_library { name: "libexpat", host_supported: true, stl: "none", unique_host_soname: true }
+        cc_library { name: "libzstd", host_supported: true, stl: "none" }
+        cc_library { name: "libpng", host_supported: true, stl: "none", shared_libs: ["libz"] }
+        cc_library { name: "libjpeg", host_supported: true, stl: "none" }
+        cc_library { name: "libz_stable", host_supported: true, stl: "none" }
+        cc_binary {
+            name: "consumer", host_supported: true, stl: "none",
+            static_libs: ["libbz", "libexpat", "libzstd", "libpng", "libjpeg", "libz_stable"],
+            shared_libs: ["libz"],
+        }
+        cc_binary_host { name: "static_zlib_consumer", stl: "none", static_libs: ["libz"] }
+    `
+	for _, component := range []string{"bzip2", "zlib", "expat", "zstd", "libpng", "libjpeg-turbo"} {
+		// Match the actual source license visibility: adapters must live under
+		// the component's directory, not a combined vendor adapter package.
+		fs["external/"+component+"/Android.bp"] = []byte(fmt.Sprintf(
+			`license { name: "external_%s_license", license_kinds: ["fixture_kind"], visibility: [":__subpackages__"] }`, component))
+	}
+	for _, scenario := range []string{"disabled", "enabled", "missing-zlib"} {
+		t.Run(scenario, func(t *testing.T) {
+			inputs := android.MockFS{}
+			for name, data := range fs {
+				if scenario != "missing-zlib" || !strings.HasSuffix(name, "/libz-host.so") {
+					inputs[name] = data
+				}
+			}
+			optIn := "true"
+			if scenario == "disabled" {
+				optIn = "false"
+			}
+			result := android.GroupFixturePreparers(
+				prepareForPrebuiltTest,
+				android.PrepareForTestWithLicenses,
+				android.FixtureMergeEnv(map[string]string{"LINEAGE_USE_PACKAGED_HOST_LIBS": optIn}),
+				inputs.AddToFixture(),
+			).RunTestWithBp(t, bp)
+			host := result.Config.BuildOS.String() + "_" + result.Config.BuildArch.String()
+			for _, name := range []string{"libbz", "libz", "libexpat", "libzstd", "libpng", "libjpeg"} {
+				selected := scenario != "disabled" && !(scenario == "missing-zlib" && (name == "libz" || name == "libpng"))
+				source := result.ModuleForTests(t, name, host+"_static").Module().(*Module)
+				if source.IsReplacedByPrebuilt() != selected {
+					t.Fatalf("%s static selected = %v; want %v", name, source.IsReplacedByPrebuilt(), selected)
+				}
+				device := result.ModuleForTests(t, name, "android_arm64_armv8-a_static").Module().(*Module)
+				if device.IsReplacedByPrebuilt() {
+					t.Fatalf("%s device variant replaced by host package", name)
+				}
+				consumerName, linkage := "consumer", "static"
+				if name == "libz" {
+					linkage = "shared"
+				}
+				providerName := name
+				if selected {
+					providerName = "prebuilt_" + name
+				}
+				provider := result.ModuleForTests(t, providerName, host+"_"+linkage).Module()
+				if !android.HasDirectDep(result.TestContext, result.ModuleForTests(t, consumerName, host).Module(), provider) {
+					t.Fatalf("consumer does not use selected %s provider", name)
+				}
+			}
+			stable := result.ModuleForTests(t, "libz_stable", host+"_static").Module().(*Module)
+			if stable.IsReplacedByPrebuilt() {
+				t.Fatal("legacy OTA libz_stable must retain source")
+			}
+			if scenario == "enabled" {
+				png := result.ModuleForTests(t, "prebuilt_libpng", host+"_static").Module()
+				zlib := result.ModuleForTests(t, "prebuilt_libz", host+"_shared").Module()
+				if !android.HasDirectDep(result.TestContext, png, zlib) {
+					t.Fatal("PNG lost its shared zlib dependency")
+				}
+			}
+		})
+	}
+}
+
 func TestPackagedHostLibraryDependencyOrdering(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Skip("packaged host libraries require Linux x86-64")
