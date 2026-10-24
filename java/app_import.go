@@ -80,6 +80,7 @@ var (
 func RegisterAppImportBuildComponents(ctx android.RegistrationContext) {
 	ctx.RegisterModuleType("android_app_import", AndroidAppImportFactory)
 	ctx.RegisterModuleType("android_test_import", AndroidTestImportFactory)
+	ctx.RegisterModuleType("android_packaged_app", AndroidPackagedAppFactory)
 	ctx.PreArchMutators(func(ctx android.RegisterMutatorsContext) {
 		ctx.BottomUp("disable_prebuilts_without_apk", disablePrebuiltsWithoutApkMutator)
 	})
@@ -104,6 +105,10 @@ type AndroidAppImport struct {
 	usesLibrary usesLibrary
 
 	installPath android.InstallPath
+
+	packagedApp packagedAppProperties
+	// Build-time check of a packaged app's source inputs, run before its APK is used.
+	packagedValidation android.Path
 }
 
 type AndroidAppImportProperties struct {
@@ -299,9 +304,10 @@ func (a *AndroidAppImport) uncompressEmbeddedJniLibs(
 	}
 
 	ctx.Build(pctx, android.BuildParams{
-		Rule:   uncompressEmbeddedJniLibsRule,
-		Input:  inputPath,
-		Output: outputPath,
+		Rule:       uncompressEmbeddedJniLibsRule,
+		Input:      inputPath,
+		Output:     outputPath,
+		Validation: a.packagedValidation,
 	})
 }
 
@@ -353,7 +359,19 @@ func (a *AndroidAppImport) stripEmbeddedJniLibsUnusedArch(
 }
 
 func (a *AndroidAppImport) GenerateAndroidBuildActions(ctx android.ModuleContext) {
+	if a.packagedApp.Package_manifest != nil && !a.prebuilt.UsePrebuilt() {
+		// An unverified package keeps the source app; it has nothing to build.
+		a.HideFromMake()
+		a.SkipInstall()
+		return
+	}
+	if a.packagedApp.Package_manifest != nil {
+		a.packagedValidation = a.packagedAppInputValidation(ctx)
+	}
 	a.generateAndroidBuildActions(ctx)
+	if a.packagedApp.Package_manifest != nil {
+		a.setPackagedAppOutputs(ctx)
+	}
 
 	moduleInfoJSON := ctx.ModuleInfoJSON()
 	moduleInfoJSON.Class = []string{"APPS"}

@@ -551,9 +551,19 @@ type dependencyTag struct {
 	static bool
 
 	installable bool
+
+	// True if the dependency needs the source module even when a prebuilt
+	// replaces it, for example to compile against an app's classes.
+	keepSource bool
 }
 
 var _ android.InstallNeededDependencyTag = (*dependencyTag)(nil)
+
+func (d dependencyTag) ReplaceSourceWithPrebuilt() bool {
+	return !d.keepSource
+}
+
+var _ android.ReplaceSourceWithPrebuilt = dependencyTag{}
 
 func (d dependencyTag) InstallDepNeeded() bool {
 	return d.installable
@@ -629,7 +639,7 @@ var (
 	proguardRaiseTag           = dependencyTag{name: "proguard-raise"}
 	certificateTag             = dependencyTag{name: "certificate"}
 	headerJarOverrideTag       = dependencyTag{name: "header-jar-override"}
-	instrumentationForTag      = dependencyTag{name: "instrumentation_for"}
+	instrumentationForTag      = dependencyTag{name: "instrumentation_for", keepSource: true}
 	extraLintCheckTag          = dependencyTag{name: "extra-lint-check", toolchain: true}
 	jniLibTag                  = dependencyTag{name: "jnilib", runtimeLinked: true}
 	r8LibraryJarTag            = dependencyTag{name: "r8-libraryjar", runtimeLinked: true}

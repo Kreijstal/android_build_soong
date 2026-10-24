@@ -517,6 +517,7 @@ func (a *AndroidAppImport) PrepareAndroidMKProviderInfo(config android.Config) *
 	info.PrimaryInfo.SetBoolIfTrue("LOCAL_PRIVILEGED_MODULE", a.Privileged())
 	info.PrimaryInfo.SetString("LOCAL_CERTIFICATE", a.certificate.AndroidMkString())
 	info.PrimaryInfo.AddStrings("LOCAL_OVERRIDES_PACKAGES", a.properties.Overrides...)
+	info.PrimaryInfo.Required = append(info.PrimaryInfo.Required, a.packagedApp.Auto_generated_rros...)
 	if len(a.dexpreopter.builtInstalled) > 0 {
 		info.PrimaryInfo.SetString("LOCAL_SOONG_BUILT_INSTALLED", a.dexpreopter.builtInstalled)
 	}

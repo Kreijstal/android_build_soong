@@ -22,3 +22,30 @@ func TestTargetPackageContext(t *testing.T) {
 		t.Fatal("different CPU feature baseline accepted")
 	}
 }
+
+func TestTargetPackageSourceContext(t *testing.T) {
+	var config ProductVariables
+	config.DeviceName = stringPtr("r8q")
+	config.VendorVars = map[string]map[string]string{"lineageVarsPlugin": {"KERNEL_MAKE_CMD": "/src/a/prebuilts/make"}}
+	first := TargetPackageSourceContext(config, "out", "/src/a")
+	config.VendorVars["lineageVarsPlugin"]["KERNEL_MAKE_CMD"] = "/src/b/prebuilts/make"
+	if first != TargetPackageSourceContext(config, "out", "/src/b/") {
+		t.Fatal("moving the checkout changed the app package context")
+	}
+	if first == TargetPackageSourceContext(config, "out", "/src/a") {
+		t.Fatal("a path outside the checkout was accepted as normalized")
+	}
+	config.VendorVars["lineageVarsPlugin"]["KERNEL_MAKE_CMD"] = "/src/b/prebuilts/other"
+	if first == TargetPackageSourceContext(config, "out", "/src/b") {
+		t.Fatal("a different tool path accepted the same context")
+	}
+	// Values Soong derives after loading the file must not change the hash.
+	config.Native_coverage = boolPtr(false)
+	config.Build_from_text_stub = boolPtr(true)
+	sdk := "36"
+	config.Platform_sdk_version_or_codename = &sdk
+	config.VendorVars["lineageVarsPlugin"]["KERNEL_MAKE_CMD"] = "/src/b/prebuilts/make"
+	if first != TargetPackageSourceContext(config, "out", "/src/b") {
+		t.Fatal("derived configuration values changed the app package context")
+	}
+}

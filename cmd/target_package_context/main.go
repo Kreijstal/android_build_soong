@@ -12,6 +12,7 @@ import (
 func main() {
 	variables := flag.String("variables", "", "completed reference product variables JSON")
 	out := flag.String("out-dir", "out", "reference OUT_DIR as used in the JSON")
+	source := flag.String("source-dir", "", "reference checkout path; selects the checkout-independent app context")
 	flag.Parse()
 	raw, err := os.ReadFile(*variables)
 	if err != nil {
@@ -20,6 +21,10 @@ func main() {
 	var config android.ProductVariables
 	if err := json.Unmarshal(raw, &config); err != nil {
 		panic(err)
+	}
+	if *source != "" {
+		fmt.Println(android.TargetPackageSourceContext(config, *out, *source))
+		return
 	}
 	fmt.Println(android.TargetPackageContext(config, *out))
 }
